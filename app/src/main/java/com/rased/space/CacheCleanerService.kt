@@ -14,19 +14,30 @@ import android.widget.Toast
 class CacheCleanerService : AccessibilityService() {
 
     companion object {
+        const val CACHE = 0
+        const val DATA = 1
+
         @Volatile var instance: CacheCleanerService? = null
         @Volatile var running = false
         @Volatile var finished = false
 
-        fun start(pkgs: List<String>): Boolean {
+        fun start(pkgs: List<String>, mode: Int): Boolean {
             val s = instance ?: return false
-            s.begin(pkgs)
+            s.begin(pkgs, mode)
             return true
         }
 
-        private val CLEAR_KEYS = listOf(
+        private val CACHE_KEYS = listOf(
             "clear cache", "مسح الذاكرة المؤقتة", "مسح ذاكرة التخزين المؤقت",
             "مسح التخزين المؤقت", "مسح الكاش", "مسح ذاكرة التخزين المؤقتة"
+        )
+        private val DATA_KEYS = listOf(
+            "clear storage", "clear all data", "clear data",
+            "مسح التخزين", "مسح كل البيانات", "مسح جميع البيانات",
+            "مسح البيانات", "مسح مساحة التخزين", "مسح بيانات"
+        )
+        private val CONFIRM_KEYS = listOf(
+            "ok", "delete", "clear", "حسنًا", "حسناً", "موافق", "موافقة", "حذف", "مسح"
         )
         private val STORAGE_KEYS = listOf("storage", "التخزين")
         private val BAD_STORAGE = listOf("clear", "مسح", "delete", "حذف")
@@ -34,7 +45,9 @@ class CacheCleanerService : AccessibilityService() {
 
     private val h = Handler(Looper.getMainLooper())
     private val queue = ArrayDeque<String>()
+    private var mode = CACHE
     private var step = 0
+    private var clicks = 0
     private var token = 0
     private var busy = false
     private var total = 0
@@ -58,9 +71,10 @@ class CacheCleanerService : AccessibilityService() {
         if (running) reschedule(300)
     }
 
-    private fun begin(pkgs: List<String>) {
+    private fun begin(pkgs: List<String>, m: Int) {
         queue.clear()
         queue.addAll(pkgs)
+        mode = m
         total = pkgs.size
         running = true
         finished = false
@@ -71,6 +85,7 @@ class CacheCleanerService : AccessibilityService() {
         token++
         busy = false
         step = 0
+        clicks = 0
         val pkg = queue.removeFirstOrNull()
         if (pkg == null) {
             finish()
@@ -89,7 +104,7 @@ class CacheCleanerService : AccessibilityService() {
         }
         reschedule(1300)
         // مهلة أمان: لو علق تطبيق ننتقل للتالي
-        h.postDelayed({ if (t == token && running) next() }, 9000)
+        h.postDelayed({ if (t == token && running) next() }, 10000)
     }
 
     private fun finish() {
@@ -120,16 +135,51 @@ class CacheCleanerService : AccessibilityService() {
             return
         }
 
-        val clear = find(root, CLEAR_KEYS) {
-            (it.contains("cache") || it.contains("مؤقت") || it.contains("كاش")) &&
-                !it.contains("data") && !it.contains("بيانات")
+        // مسح البيانات: بعد الضغط على الزر نبحث عن زر التأكيد في النافذة
+        if (mode == DATA && step >= 2) {
+            val ok = findExact(root, CONFIRM_KEYS)
+            if (ok != null) {
+                busy = true
+                ok.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                val t = token
+                h.postDelayed({ if (t == token && running) next() }, 1000)
+                return
+            }
         }
-        if (clear != null) {
-            busy = true
-            if (clear.isEnabled) clear.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            val t = token
-            h.postDelayed({ if (t == token && running) next() }, 700)
-            return
+
+        if (mode == CACHE) {
+            val clear = find(root, CACHE_KEYS) {
+                (it.contains("cache") || it.contains("مؤقت") || it.contains("كاش")) &&
+                    !it.contains("data") && !it.contains("بيانات")
+            }
+            if (clear != null) {
+                busy = true
+                if (clear.isEnabled) clear.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                val t = token
+                h.postDelayed({ if (t == token && running) next() }, 700)
+                return
+            }
+        } else {
+            val clear = find(root, DATA_KEYS) {
+                (it.contains("clear") || it.contains("مسح") || it.contains("delete") || it.contains("حذف")) &&
+                    (it.contains("data") || it.contains("storage") || it.contains("بيانات") || it.contains("تخزين")) &&
+                    !it.contains("cache") && !it.contains("مؤقت") && !it.contains("كاش") &&
+                    !it.contains("manage") && !it.contains("إدارة")
+            }
+            if (clear != null) {
+                if (!clear.isEnabled) {      // لا توجد بيانات لمسحها
+                    busy = true
+                    next()
+                    return
+                }
+                if (clicks < 3) {
+                    clicks++
+                    clear.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    step = 2
+                    reschedule(900)
+                    return
+                }
+            }
         }
 
         if (step == 0) {
@@ -148,6 +198,20 @@ class CacheCleanerService : AccessibilityService() {
             for (n in root.findAccessibilityNodeInfosByText(k)) {
                 val t = n.text?.toString()?.lowercase() ?: continue
                 if (!ok(t)) continue
+                var c: AccessibilityNodeInfo? = n
+                while (c != null && !c.isClickable) c = c.parent
+                if (c != null) return c
+            }
+        }
+        return null
+    }
+
+    // مطابقة تامة للنص (لأزرار التأكيد فقط)
+    private fun findExact(root: AccessibilityNodeInfo, keys: List<String>): AccessibilityNodeInfo? {
+        for (k in keys) {
+            for (n in root.findAccessibilityNodeInfosByText(k)) {
+                val t = n.text?.toString()?.trim() ?: continue
+                if (!t.equals(k, ignoreCase = true)) continue
                 var c: AccessibilityNodeInfo? = n
                 while (c != null && !c.isClickable) c = c.parent
                 if (c != null) return c
