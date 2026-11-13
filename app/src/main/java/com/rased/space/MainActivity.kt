@@ -53,6 +53,7 @@ data class AppItem(
 class MainActivity : Activity() {
 
     private val REQ_UNINSTALL = 77
+    private val CACHE_LEFT_LIMIT = 16 * 1024L   // أقل من هذا يُعتبر ممسوحًا
 
     private var all: List<AppItem> = emptyList()
     private var shown: List<AppItem> = emptyList()
@@ -64,6 +65,11 @@ class MainActivity : Activity() {
     private var lastLoad = 0L
     private var uninstalling = false
     private val uninstallQueue = ArrayDeque<String>()
+
+    // التحقق وإعادة المحاولة لمسح الكاش
+    private var cleanTargets: Set<String> = emptySet()
+    private var cleanRound = 0
+    private var verify = false
 
     private val loader = Executors.newSingleThreadExecutor()
     private val statsPool = Executors.newFixedThreadPool(4)
@@ -85,6 +91,12 @@ class MainActivity : Activity() {
     private lateinit var btnTop: TextView
     private lateinit var btnBottom: TextView
     private lateinit var empty: TextView
+    private lateinit var scrollBar: FastScrollBar
+
+    private val searchRun = Runnable {
+        render()
+        list.scrollToPosition(0)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -104,6 +116,7 @@ class MainActivity : Activity() {
         btnTop = findViewById(R.id.btnTop)
         btnBottom = findViewById(R.id.btnBottom)
         empty = findViewById(R.id.empty)
+        scrollBar = findViewById(R.id.scrollBar)
         chips = listOf(
             findViewById(R.id.chipTotal), findViewById(R.id.chipApp),
             findViewById(R.id.chipData), findViewById(R.id.chipCache)
@@ -135,15 +148,15 @@ class MainActivity : Activity() {
         }
         btnClean.setOnClickListener { startAction() }
 
-        // البحث
+        // البحث (مع تأخير بسيط ليبقى الكتابة سلسة)
         search.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
             override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
             override fun afterTextChanged(s: Editable?) {
                 query = norm(s?.toString() ?: "")
                 btnClear.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
-                render()
-                list.scrollToPosition(0)
+                list.removeCallbacks(searchRun)
+                list.postDelayed(searchRun, 120)
             }
         })
         search.setOnEditorActionListener { _, id, _ ->
@@ -151,7 +164,6 @@ class MainActivity : Activity() {
         }
         btnClear.setOnClickListener { search.setText("") }
 
-        // أزرار أول/آخر القائمة
         btnTop.setOnClickListener { list.scrollToPosition(0) }
         btnBottom.setOnClickListener {
             val n = adapter.itemCount
@@ -164,13 +176,17 @@ class MainActivity : Activity() {
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter = this@MainActivity.adapter
             itemAnimator = null
-            setItemViewCacheSize(12)
+            setItemViewCacheSize(14)
             addOnScrollListener(object : RecyclerView.OnScrollListener() {
                 override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
                     if (newState == RecyclerView.SCROLL_STATE_DRAGGING) hideKeyboard()
                 }
                 override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) { updateJump() }
             })
+        }
+        scrollBar.attach(list)
+        scrollBar.label = { p ->
+            shown.getOrNull(p)?.let { "${p + 1}/${shown.size}  ${it.label}" } ?: ""
         }
     }
 
@@ -182,9 +198,14 @@ class MainActivity : Activity() {
         }
         permPanel.visibility = View.GONE
         if (uninstalling) return
-        val force = CacheCleanerService.finished
-        if (force) CacheCleanerService.finished = false
-        if (force || all.isEmpty()) load(true)
+        if (CacheCleanerService.finished) {
+            CacheCleanerService.finished = false
+            verify = cleanTargets.isNotEmpty()
+            // ننتظر لحظة حتى يحدّث النظام أرقام المساحة
+            list.postDelayed({ load(true) }, 1500)
+            return
+        }
+        if (all.isEmpty()) load(true)
         else if (SystemClock.elapsedRealtime() - lastLoad > 30_000) load(false)
     }
 
@@ -222,6 +243,7 @@ class MainActivity : Activity() {
     private fun updateJump() {
         btnTop.visibility = if (list.canScrollVertically(-1)) View.VISIBLE else View.GONE
         btnBottom.visibility = if (list.canScrollVertically(1)) View.VISIBLE else View.GONE
+        scrollBar.invalidate()
     }
 
     private fun load(spinner: Boolean) {
@@ -262,8 +284,39 @@ class MainActivity : Activity() {
                 swipe.isRefreshing = false
                 selected.retainAll(res.map { it.pkg }.toSet())
                 render()
+                if (verify) {
+                    verify = false
+                    checkClean()
+                }
             }
         }
+    }
+
+    // بعد كل جولة مسح: نقرأ المساحة ونعيد المحاولة على ما بقي له كاش
+    private fun checkClean() {
+        val remain = all.filter { it.pkg in cleanTargets && it.cache > CACHE_LEFT_LIMIT }
+        if (remain.isEmpty()) {
+            cleanTargets = emptySet()
+            Toast.makeText(this, "تم مسح الكاش بنجاح ✓", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (cleanRound >= 3 || CacheCleanerService.instance == null) {
+            cleanTargets = emptySet()
+            val names = remain.joinToString("\n") { "• ${it.label} (${fmt(it.cache)})" }
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("تعذّر مسح كاش ${remain.size} تطبيق")
+                .setMessage(
+                    names + "\n\nبعض التطبيقات تعيد إنشاء الكاش فور تشغيلها (خصوصًا تطبيقات النظام وخدمات Google)، " +
+                        "أو تكون شاشة الإعدادات في جهازك مختلفة. جرّب «معلومات / مسح» لكل تطبيق منها."
+                )
+                .setPositiveButton("حسنًا", null)
+                .show()
+            return
+        }
+        cleanRound++
+        cleanTargets = remain.map { it.pkg }.toSet()
+        Toast.makeText(this, "إعادة محاولة ${remain.size} تطبيق ($cleanRound/3)", Toast.LENGTH_SHORT).show()
+        CacheCleanerService.start(remain.sortedByDescending { it.cache }.map { it.pkg }, CacheCleanerService.CACHE)
     }
 
     private fun value(a: AppItem): Long = when (sortKey) {
@@ -335,7 +388,7 @@ class MainActivity : Activity() {
         }
         when (sortKey) {
             3 -> {
-                val t = sel.filter { it.cache > 0 }.sortedByDescending { it.cache }
+                val t = sel.filter { it.cache > CACHE_LEFT_LIMIT }.sortedByDescending { it.cache }
                 if (t.isEmpty()) {
                     Toast.makeText(this, "التطبيقات المختارة ليس بها كاش", Toast.LENGTH_SHORT).show()
                     return
@@ -343,11 +396,14 @@ class MainActivity : Activity() {
                 if (!ensureService()) return
                 dialog(
                     "مسح الكاش",
-                    "سيتم مسح كاش ${t.size} تطبيق (${fmt(t.sumOf { it.cache })}) تلقائيًا بفتح إعدادات كل تطبيق.\n\n" +
+                    "سيتم مسح كاش ${t.size} تطبيق (${fmt(t.sumOf { it.cache })}) تلقائيًا بفتح إعدادات كل تطبيق، " +
+                        "ثم يتحقق التطبيق من النتيجة ويعيد المحاولة على أي تطبيق بقي له كاش.\n\n" +
                         "لا تلمس الشاشة أثناء العملية، وسيعود التطبيق تلقائيًا عند الانتهاء.",
                     "ابدأ"
                 ) {
                     selected.clear()
+                    cleanTargets = t.map { it.pkg }.toSet()
+                    cleanRound = 1
                     CacheCleanerService.start(t.map { it.pkg }, CacheCleanerService.CACHE)
                 }
             }
@@ -366,6 +422,7 @@ class MainActivity : Activity() {
                     "نعم، امسح البيانات"
                 ) {
                     selected.clear()
+                    cleanTargets = emptySet()
                     CacheCleanerService.start(t.map { it.pkg }, CacheCleanerService.DATA)
                 }
             }
