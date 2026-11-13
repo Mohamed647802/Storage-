@@ -53,6 +53,7 @@ class CacheCleanerService : AccessibilityService() {
     private var step = 0
     private var clicks = 0
     private var miss = 0
+    private var atEnd = 0
     private var token = 0
     private var busy = false
     private var total = 0
@@ -100,6 +101,7 @@ class CacheCleanerService : AccessibilityService() {
         step = 0
         clicks = 0
         miss = 0
+        atEnd = 0
         val pkg = queue.removeFirstOrNull()
         if (pkg == null) {
             finish()
@@ -120,7 +122,7 @@ class CacheCleanerService : AccessibilityService() {
         Toast.makeText(this, "$done / $total", Toast.LENGTH_SHORT).show()
         reschedule(900)
         // مهلة أمان: لو علق تطبيق ننتقل للتالي (والتحقق سيعيده لاحقًا)
-        h.postDelayed({ if (t == token && running) next() }, 12000)
+        h.postDelayed({ if (t == token && running) next() }, 16000)
     }
 
     private fun finish() {
@@ -167,7 +169,7 @@ class CacheCleanerService : AccessibilityService() {
                 it.hasAny(CACHE_WORDS) && it.hasAny(VERBS) &&
                     !it.contains("data") && !it.contains("بيانات")
             }
-            if (clear != null) {
+            if (clear != null && clear.isVisibleToUser) {
                 if (clear.isEnabled) tap(clear)
                 scheduleNext(700)
                 return
@@ -178,7 +180,7 @@ class CacheCleanerService : AccessibilityService() {
                     (it.contains("data") || it.contains("storage") || it.contains("بيانات") || it.contains("تخزين")) &&
                     !it.hasAny(CACHE_WORDS) && !it.contains("manage") && !it.contains("إدارة")
             }
-            if (clear != null) {
+            if (clear != null && clear.isVisibleToUser) {
                 if (!clear.isEnabled) {      // لا توجد بيانات لمسحها
                     scheduleNext(200)
                     return
@@ -195,17 +197,52 @@ class CacheCleanerService : AccessibilityService() {
 
         // لم نجد الزر بعد
         miss++
+
         if (step == 0) {
-            val st = find(root, STORAGE_KEYS) { s -> !s.hasAny(BAD_STORAGE) }
-            if (st != null && tap(st)) step = 1
-        } else if (miss % 5 == 0) {
-            // ربما عدنا لصفحة المعلومات: نعيد فتح التخزين
-            val st = find(root, STORAGE_KEYS) { s -> !s.hasAny(BAD_STORAGE) }
-            if (st != null) tap(st)
-        } else if (miss % 3 == 0) {
-            scroll(root)
+            // صفحة معلومات التطبيق: نبحث عن «التخزين» وننزل لأسفل حتى يظهر
+            val st = findStorage(root)
+            if (st != null && tap(st)) {
+                step = 1
+                miss = 0
+                atEnd = 0
+                reschedule(600)
+                return
+            }
+            scrollDown(root)
+            if (atEnd >= 2) {
+                // وصلنا لآخر الصفحة ولم نجده: نرجع لأولها ونعيد المحاولة
+                scrollToTop(root)
+                atEnd = 0
+            }
+            reschedule(350)
+            return
         }
-        reschedule(500)
+
+        // داخل صفحة التخزين: ننتظر قليلًا ثم ننزل لنجد الزر
+        if (miss >= 2) {
+            scrollDown(root)
+            if (atEnd >= 2) {
+                // وصلنا للنهاية بلا زر: ربما لسنا في صفحة التخزين، نعيد البحث عنها
+                atEnd = 0
+                scrollToTop(root)
+                val st = findStorage(root)
+                if (st != null) tap(st) else step = 0
+            }
+        }
+        reschedule(400)
+    }
+
+    private fun findStorage(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        for (k in STORAGE_KEYS) {
+            for (n in root.findAccessibilityNodeInfosByText(k)) {
+                val t = (n.text ?: n.contentDescription)?.toString()?.lowercase() ?: continue
+                if (t.hasAny(BAD_STORAGE) || t.length > 45) continue
+                var c: AccessibilityNodeInfo? = n
+                while (c != null && !c.isClickable) c = c.parent
+                if (c != null && c.isVisibleToUser) return c
+            }
+        }
+        return null
     }
 
     private fun tap(n: AccessibilityNodeInfo): Boolean {
@@ -220,19 +257,56 @@ class CacheCleanerService : AccessibilityService() {
         return dispatchGesture(g, null, null)
     }
 
-    private fun scroll(root: AccessibilityNodeInfo) {
-        val s = findScrollable(root) ?: return
-        s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+    // تمرير لأسفل: أولًا بإجراء الوصول، وإن لم توجد قائمة نستخدم إيماءة سحب
+    private fun scrollDown(root: AccessibilityNodeInfo) {
+        val s = findScrollable(root)
+        if (s != null) {
+            if (s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) atEnd = 0 else atEnd++
+        } else {
+            swipe(true)
+        }
     }
 
-    private fun findScrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if (n.isScrollable) return n
-        for (i in 0 until n.childCount) {
-            val c = n.getChild(i) ?: continue
-            val r = findScrollable(c)
-            if (r != null) return r
+    private fun scrollToTop(root: AccessibilityNodeInfo) {
+        val s = findScrollable(root)
+        if (s != null) {
+            var i = 0
+            while (i < 8 && s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) i++
+        } else {
+            swipe(false)
         }
-        return null
+    }
+
+    private fun swipe(up: Boolean) {
+        val dm = resources.displayMetrics
+        val x = dm.widthPixels / 2f
+        val y1 = dm.heightPixels * (if (up) 0.75f else 0.30f)
+        val y2 = dm.heightPixels * (if (up) 0.30f else 0.75f)
+        val p = Path().apply { moveTo(x, y1); lineTo(x, y2) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 250))
+            .build()
+        dispatchGesture(g, null, null)
+    }
+
+    // أكبر عنصر قابل للتمرير على الشاشة
+    private fun findScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = 0L
+        val r = Rect()
+        fun walk(n: AccessibilityNodeInfo) {
+            if (n.isScrollable) {
+                n.getBoundsInScreen(r)
+                val a = r.width().toLong() * r.height()
+                if (a > bestArea) { bestArea = a; best = n }
+            }
+            for (i in 0 until n.childCount) {
+                val c = n.getChild(i) ?: continue
+                walk(c)
+            }
+        }
+        walk(root)
+        return best
     }
 
     private fun find(
