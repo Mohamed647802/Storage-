@@ -19,8 +19,8 @@ class FastScrollBar @JvmOverloads constructor(c: Context, a: AttributeSet? = nul
 
     private var rv: RecyclerView? = null
     private val d = resources.displayMetrics.density
-    private val barW = 48 * d
-    private val thumbH = 120 * d
+    private val barW = 34 * d
+    private val thumbH = 84 * d
     private var dragging = false
     private var frac = 0f
 
@@ -28,7 +28,7 @@ class FastScrollBar @JvmOverloads constructor(c: Context, a: AttributeSet? = nul
     private val pThumb = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF7C5CFF.toInt() }
     private val pThumbOn = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFB7A6FF.toInt() }
     private val pGrip = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xFFFFFFFF.toInt(); strokeWidth = 3 * d; strokeCap = Paint.Cap.ROUND
+        color = 0xFFFFFFFF.toInt(); strokeWidth = 2.5f * d; strokeCap = Paint.Cap.ROUND
     }
     private val pBubble = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF2A3157.toInt() }
     private val pBubbleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -60,15 +60,15 @@ class FastScrollBar @JvmOverloads constructor(c: Context, a: AttributeSet? = nul
 
         val right = width.toFloat()
         val left = right - barW
-        canvas.drawRoundRect(RectF(left + 8 * d, 0f, right - 8 * d, height.toFloat()), 16 * d, 16 * d, pTrack)
+        canvas.drawRoundRect(RectF(left + 6 * d, 0f, right - 6 * d, height.toFloat()), 12 * d, 12 * d, pTrack)
 
         val top = frac * (height - thumbH)
-        val thumb = RectF(left + 2 * d, top, right - 2 * d, top + thumbH)
-        canvas.drawRoundRect(thumb, 14 * d, 14 * d, if (dragging) pThumbOn else pThumb)
+        val thumb = RectF(left + 1 * d, top, right - 1 * d, top + thumbH)
+        canvas.drawRoundRect(thumb, 12 * d, 12 * d, if (dragging) pThumbOn else pThumb)
         val cx = thumb.centerX()
         val cy = thumb.centerY()
-        for (o in floatArrayOf(-12 * d, 0f, 12 * d)) {
-            canvas.drawLine(cx - 11 * d, cy + o, cx + 11 * d, cy + o, pGrip)
+        for (o in floatArrayOf(-9 * d, 0f, 9 * d)) {
+            canvas.drawLine(cx - 8 * d, cy + o, cx + 8 * d, cy + o, pGrip)
         }
 
         if (dragging) {
