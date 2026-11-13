@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.app.AppOpsManager
 import android.app.usage.StorageStatsManager
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.res.ColorStateList
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Build
@@ -35,12 +37,15 @@ data class AppItem(
     val pkg: String,
     val app: Long,
     val data: Long,   // البيانات بدون الكاش
-    val cache: Long
+    val cache: Long,
+    val system: Boolean
 ) {
     val total: Long get() = app + data + cache
 }
 
 class MainActivity : Activity() {
+
+    private val REQ_UNINSTALL = 77
 
     private var all: List<AppItem> = emptyList()
     private val selected = HashSet<String>()
@@ -48,6 +53,8 @@ class MainActivity : Activity() {
     private var desc = true
     private var loading = false
     private var lastLoad = 0L
+    private var uninstalling = false
+    private val uninstallQueue = ArrayDeque<String>()
 
     private val loader = Executors.newSingleThreadExecutor()
     private val statsPool = Executors.newFixedThreadPool(4)
@@ -62,6 +69,7 @@ class MainActivity : Activity() {
     private lateinit var chipDir: TextView
     private lateinit var chipAll: TextView
     private lateinit var btnClean: Button
+    private lateinit var bottomBar: View
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,6 +81,7 @@ class MainActivity : Activity() {
         chipDir = findViewById(R.id.chipDir)
         chipAll = findViewById(R.id.chipAll)
         btnClean = findViewById(R.id.btnClean)
+        bottomBar = chipAll.parent as View
         chips = listOf(
             findViewById(R.id.chipTotal), findViewById(R.id.chipApp),
             findViewById(R.id.chipData), findViewById(R.id.chipCache)
@@ -85,16 +94,23 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.btnGrant).setOnClickListener {
             startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
         }
-        chips.forEachIndexed { i, c -> c.setOnClickListener { sortKey = i; render() } }
+        chips.forEachIndexed { i, c ->
+            c.setOnClickListener {
+                if (sortKey != i) selected.clear()
+                sortKey = i
+                render()
+            }
+        }
         chipDir.setOnClickListener { desc = !desc; render() }
 
         chipAll.setOnClickListener {
-            if (all.isNotEmpty() && selected.size == all.size) selected.clear()
-            else selected.addAll(all.map { it.pkg })
+            val pool = all.filter { selectable(it) }.map { it.pkg }
+            if (pool.isNotEmpty() && pool.all { it in selected }) selected.removeAll(pool.toSet())
+            else selected.addAll(pool)
             adapter.notifyDataSetChanged()
             updateBar()
         }
-        btnClean.setOnClickListener { startClean() }
+        btnClean.setOnClickListener { startAction() }
 
         adapter = Adapter()
         adapter.setHasStableIds(true)
@@ -113,6 +129,7 @@ class MainActivity : Activity() {
             return
         }
         permPanel.visibility = View.GONE
+        if (uninstalling) return
         val force = CacheCleanerService.finished
         if (force) CacheCleanerService.finished = false
         if (force || all.isEmpty()) load(true)
@@ -146,7 +163,8 @@ class MainActivity : Activity() {
                         val st = ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, ai.packageName, user)
                         val cache = st.cacheBytes
                         val data = (st.dataBytes - cache).coerceAtLeast(0)
-                        AppItem(ai.loadLabel(pm).toString(), ai.packageName, st.appBytes, data, cache)
+                        val sys = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                        AppItem(ai.loadLabel(pm).toString(), ai.packageName, st.appBytes, data, cache, sys)
                     } catch (e: Exception) {
                         null
                     }
@@ -173,6 +191,14 @@ class MainActivity : Activity() {
         else -> a.cache
     }
 
+    // هل يمكن تحديد هذا التطبيق في التبويب الحالي؟
+    private fun selectable(a: AppItem): Boolean = when (sortKey) {
+        1 -> !a.system && a.pkg != packageName   // الإزالة: تطبيقات المستخدم فقط
+        2 -> a.pkg != packageName                // مسح البيانات: ما عدا هذا التطبيق
+        3 -> true                                // الكاش: الكل
+        else -> false
+    }
+
     private fun render() {
         val sorted = if (desc) all.sortedByDescending { value(it) } else all.sortedBy { value(it) }
         adapter.submit(sorted)
@@ -186,58 +212,145 @@ class MainActivity : Activity() {
     }
 
     private fun updateBar() {
-        val sel = all.filter { it.pkg in selected }
-        btnClean.text = if (sel.isEmpty()) "مسح الكاش" else "مسح الكاش (${sel.size}) • ${fmt(sel.sumOf { it.cache })}"
+        if (sortKey == 0) {
+            bottomBar.visibility = View.GONE
+            return
+        }
+        bottomBar.visibility = View.VISIBLE
+        val pool = all.filter { selectable(it) }
+        val sel = pool.filter { it.pkg in selected }
+        val label: String
+        val size: Long
+        val color: Int
+        when (sortKey) {
+            1 -> { label = "إزالة التطبيق"; size = sel.sumOf { it.app }; color = 0xFFEF4444.toInt() }
+            2 -> { label = "مسح البيانات"; size = sel.sumOf { it.data }; color = 0xFFEF4444.toInt() }
+            else -> { label = "مسح الكاش"; size = sel.sumOf { it.cache }; color = 0xFFF59E0B.toInt() }
+        }
+        btnClean.text = if (sel.isEmpty()) label else "$label (${sel.size}) • ${fmt(size)}"
+        btnClean.backgroundTintList = ColorStateList.valueOf(color)
+        btnClean.setTextColor(if (sortKey == 3) 0xFF1A1442.toInt() else 0xFFFFFFFF.toInt())
         btnClean.alpha = if (sel.isEmpty()) 0.5f else 1f
-        val allSel = all.isNotEmpty() && selected.size == all.size
+        val allSel = pool.isNotEmpty() && pool.all { it.pkg in selected }
         chipAll.isSelected = allSel
         chipAll.setTextColor(if (allSel) 0xFFFFFFFF.toInt() else 0xFFB4BAD6.toInt())
     }
 
-    private fun startClean() {
-        val targets = all.filter { it.pkg in selected && it.cache > 0 }.sortedByDescending { it.cache }
-        if (selected.isEmpty()) {
+    private fun startAction() {
+        val sel = all.filter { it.pkg in selected && selectable(it) }
+        if (sel.isEmpty()) {
             Toast.makeText(this, "اختر تطبيقًا واحدًا على الأقل", Toast.LENGTH_SHORT).show()
             return
         }
-        if (targets.isEmpty()) {
-            Toast.makeText(this, "التطبيقات المختارة ليس بها كاش", Toast.LENGTH_SHORT).show()
+        when (sortKey) {
+            3 -> {
+                val t = sel.filter { it.cache > 0 }.sortedByDescending { it.cache }
+                if (t.isEmpty()) {
+                    Toast.makeText(this, "التطبيقات المختارة ليس بها كاش", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                if (!ensureService()) return
+                dialog(
+                    "مسح الكاش",
+                    "سيتم مسح كاش ${t.size} تطبيق (${fmt(t.sumOf { it.cache })}) تلقائيًا بفتح إعدادات كل تطبيق.\n\n" +
+                        "لا تلمس الشاشة أثناء العملية، وسيعود التطبيق تلقائيًا عند الانتهاء.",
+                    "ابدأ"
+                ) {
+                    selected.clear()
+                    CacheCleanerService.start(t.map { it.pkg }, CacheCleanerService.CACHE)
+                }
+            }
+            2 -> {
+                val t = sel.filter { it.data > 0 }.sortedByDescending { it.data }
+                if (t.isEmpty()) {
+                    Toast.makeText(this, "التطبيقات المختارة ليس بها بيانات", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                if (!ensureService()) return
+                dialog(
+                    "تحذير: مسح البيانات",
+                    "سيتم حذف بيانات ${t.size} تطبيق (${fmt(t.sumOf { it.data })}) نهائيًا.\n\n" +
+                        "يشمل ذلك تسجيل الدخول والإعدادات والملفات والتقدم المحفوظ، ولا يمكن التراجع.\n\n" +
+                        "لا تلمس الشاشة أثناء العملية.",
+                    "نعم، امسح البيانات"
+                ) {
+                    selected.clear()
+                    CacheCleanerService.start(t.map { it.pkg }, CacheCleanerService.DATA)
+                }
+            }
+            1 -> {
+                dialog(
+                    "إزالة التطبيقات",
+                    "سيتم طلب إزالة ${sel.size} تطبيق (${fmt(sel.sumOf { it.app })}).\n\n" +
+                        "سيظهر مربع تأكيد من النظام لكل تطبيق، ويمكنك رفض أي منها.",
+                    "متابعة"
+                ) {
+                    uninstallQueue.clear()
+                    uninstallQueue.addAll(sel.map { it.pkg })
+                    selected.clear()
+                    uninstalling = true
+                    nextUninstall()
+                }
+            }
+        }
+    }
+
+    private fun nextUninstall() {
+        val p = uninstallQueue.removeFirstOrNull()
+        if (p == null) {
+            uninstalling = false
+            load(true)
             return
         }
-        if (CacheCleanerService.instance == null) {
-            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("مطلوب تفعيل خدمة")
-                .setMessage(
-                    "أندرويد لا يسمح بمسح كاش تطبيقات أخرى مباشرة، لذلك يحتاج راصد المساحة إلى خدمة تسهيل الوصول " +
-                        "لتضغط زر «مسح الذاكرة المؤقتة» نيابةً عنك.\n\n" +
-                        "فعّل «راصد المساحة» من: تسهيل الوصول ← التطبيقات المثبتة.\n\n" +
-                        "إن كان الخيار رماديًا (أندرويد 13+): افتح معلومات التطبيق ← ⋮ ← السماح بالإعدادات المقيّدة، ثم أعد المحاولة."
-                )
-                .setPositiveButton("فتح الإعدادات") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                }
-                .setNeutralButton("معلومات التطبيق") { _, _ ->
-                    startActivity(
-                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", packageName, null))
-                    )
-                }
-                .setNegativeButton("إلغاء", null)
-                .show()
-            return
-        }
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-            .setTitle("مسح الكاش")
-            .setMessage(
-                "سيتم مسح كاش ${targets.size} تطبيق (${fmt(targets.sumOf { it.cache })}) تلقائيًا بفتح إعدادات كل تطبيق.\n\n" +
-                    "لا تلمس الشاشة أثناء العملية، وسيعود التطبيق تلقائيًا عند الانتهاء."
+        try {
+            startActivityForResult(
+                Intent(Intent.ACTION_DELETE, Uri.parse("package:$p"))
+                    .putExtra(Intent.EXTRA_RETURN_RESULT, true),
+                REQ_UNINSTALL
             )
-            .setPositiveButton("ابدأ") { _, _ ->
-                selected.clear()
-                CacheCleanerService.start(targets.map { it.pkg })
+        } catch (e: Exception) {
+            nextUninstall()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_UNINSTALL) nextUninstall()
+    }
+
+    private fun dialog(title: String, msg: String, ok: String, onOk: () -> Unit) {
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle(title)
+            .setMessage(msg)
+            .setPositiveButton(ok) { _, _ -> onOk() }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun ensureService(): Boolean {
+        if (CacheCleanerService.instance != null) return true
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("مطلوب تفعيل خدمة")
+            .setMessage(
+                "أندرويد لا يسمح بمسح كاش أو بيانات تطبيقات أخرى مباشرة، لذلك يحتاج راصد المساحة إلى خدمة تسهيل الوصول " +
+                    "لتضغط الأزرار المناسبة نيابةً عنك.\n\n" +
+                    "فعّل «راصد المساحة» من: تسهيل الوصول ← التطبيقات المثبتة.\n\n" +
+                    "إن كان الخيار رماديًا (أندرويد 13+): افتح معلومات التطبيق ← ⋮ ← السماح بالإعدادات المقيّدة، ثم أعد المحاولة."
+            )
+            .setPositiveButton("فتح الإعدادات") { _, _ ->
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
+            .setNeutralButton("معلومات التطبيق") { _, _ ->
+                startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.fromParts("package", packageName, null))
+                )
             }
             .setNegativeButton("إلغاء", null)
             .show()
+        return false
     }
 
     private fun fmt(b: Long): String = Formatter.formatFileSize(this, b)
@@ -263,11 +376,17 @@ class MainActivity : Activity() {
         override fun onCreateViewHolder(p: ViewGroup, t: Int): VH {
             val h = VH(LayoutInflater.from(p.context).inflate(R.layout.item_app, p, false))
             h.itemView.setOnClickListener {
+                if (sortKey == 0) return@setOnClickListener
                 val pos = h.bindingAdapterPosition
                 if (pos < 0) return@setOnClickListener
-                val k = items[pos].pkg
-                if (!selected.add(k)) selected.remove(k)
-                h.check.isChecked = k in selected
+                val a = items[pos]
+                if (!selectable(a)) {
+                    val m = if (sortKey == 1) "تطبيق نظام أو هذا التطبيق، لا يمكن إزالته" else "لا يمكن تحديد هذا التطبيق"
+                    Toast.makeText(this@MainActivity, m, Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                if (!selected.add(a.pkg)) selected.remove(a.pkg)
+                h.check.isChecked = a.pkg in selected
                 updateBar()
             }
             h.open.setOnClickListener {
@@ -299,6 +418,9 @@ class MainActivity : Activity() {
             h.tApp.text = fmt(a.app)
             h.tData.text = fmt(a.data)
             h.tCache.text = fmt(a.cache)
+
+            h.check.visibility = if (sortKey == 0) View.GONE else View.VISIBLE
+            h.check.alpha = if (selectable(a)) 1f else 0.3f
             h.check.isChecked = a.pkg in selected
 
             h.icon.tag = a.pkg
