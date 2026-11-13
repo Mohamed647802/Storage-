@@ -15,13 +15,19 @@ import android.os.Process
 import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
 import android.text.format.Formatter
 import android.util.LruCache
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -38,7 +44,8 @@ data class AppItem(
     val app: Long,
     val data: Long,   // البيانات بدون الكاش
     val cache: Long,
-    val system: Boolean
+    val system: Boolean,
+    val key: String   // نص البحث بعد التطبيع
 ) {
     val total: Long get() = app + data + cache
 }
@@ -48,9 +55,11 @@ class MainActivity : Activity() {
     private val REQ_UNINSTALL = 77
 
     private var all: List<AppItem> = emptyList()
+    private var shown: List<AppItem> = emptyList()
     private val selected = HashSet<String>()
     private var sortKey = 0          // 0 الإجمالي, 1 التطبيق, 2 البيانات, 3 الكاش
     private var desc = true
+    private var query = ""
     private var loading = false
     private var lastLoad = 0L
     private var uninstalling = false
@@ -62,6 +71,7 @@ class MainActivity : Activity() {
     private val icons = LruCache<String, Drawable>(150)
 
     private lateinit var adapter: Adapter
+    private lateinit var list: RecyclerView
     private lateinit var summary: TextView
     private lateinit var permPanel: LinearLayout
     private lateinit var swipe: SwipeRefreshLayout
@@ -70,18 +80,30 @@ class MainActivity : Activity() {
     private lateinit var chipAll: TextView
     private lateinit var btnClean: Button
     private lateinit var bottomBar: View
+    private lateinit var search: EditText
+    private lateinit var btnClear: TextView
+    private lateinit var btnTop: TextView
+    private lateinit var btnBottom: TextView
+    private lateinit var empty: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         setContentView(R.layout.activity_main)
 
         summary = findViewById(R.id.summary)
         permPanel = findViewById(R.id.permPanel)
         swipe = findViewById(R.id.swipe)
+        list = findViewById(R.id.list)
         chipDir = findViewById(R.id.chipDir)
         chipAll = findViewById(R.id.chipAll)
         btnClean = findViewById(R.id.btnClean)
         bottomBar = chipAll.parent as View
+        search = findViewById(R.id.search)
+        btnClear = findViewById(R.id.btnClear)
+        btnTop = findViewById(R.id.btnTop)
+        btnBottom = findViewById(R.id.btnBottom)
+        empty = findViewById(R.id.empty)
         chips = listOf(
             findViewById(R.id.chipTotal), findViewById(R.id.chipApp),
             findViewById(R.id.chipData), findViewById(R.id.chipCache)
@@ -103,8 +125,9 @@ class MainActivity : Activity() {
         }
         chipDir.setOnClickListener { desc = !desc; render() }
 
+        // تحديد الكل = نتائج البحث الظاهرة فقط
         chipAll.setOnClickListener {
-            val pool = all.filter { selectable(it) }.map { it.pkg }
+            val pool = shown.filter { selectable(it) }.map { it.pkg }
             if (pool.isNotEmpty() && pool.all { it in selected }) selected.removeAll(pool.toSet())
             else selected.addAll(pool)
             adapter.notifyDataSetChanged()
@@ -112,13 +135,42 @@ class MainActivity : Activity() {
         }
         btnClean.setOnClickListener { startAction() }
 
+        // البحث
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                query = norm(s?.toString() ?: "")
+                btnClear.visibility = if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                render()
+                list.scrollToPosition(0)
+            }
+        })
+        search.setOnEditorActionListener { _, id, _ ->
+            if (id == EditorInfo.IME_ACTION_SEARCH) { hideKeyboard(); true } else false
+        }
+        btnClear.setOnClickListener { search.setText("") }
+
+        // أزرار أول/آخر القائمة
+        btnTop.setOnClickListener { list.scrollToPosition(0) }
+        btnBottom.setOnClickListener {
+            val n = adapter.itemCount
+            if (n > 0) list.scrollToPosition(n - 1)
+        }
+
         adapter = Adapter()
         adapter.setHasStableIds(true)
-        findViewById<RecyclerView>(R.id.list).apply {
+        list.apply {
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter = this@MainActivity.adapter
             itemAnimator = null
             setItemViewCacheSize(12)
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
+                    if (newState == RecyclerView.SCROLL_STATE_DRAGGING) hideKeyboard()
+                }
+                override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) { updateJump() }
+            })
         }
     }
 
@@ -146,6 +198,32 @@ class MainActivity : Activity() {
         return mode == AppOpsManager.MODE_ALLOWED
     }
 
+    // تطبيع النص للبحث: حروف صغيرة، بدون تشكيل، وتوحيد الهمزات والياء والتاء المربوطة
+    private fun norm(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (ch in s.lowercase()) {
+            when (ch) {
+                'أ', 'إ', 'آ', 'ٱ' -> sb.append('ا')
+                'ى' -> sb.append('ي')
+                'ة' -> sb.append('ه')
+                'ـ' -> {}
+                in '\u064B'..'\u065F', '\u0670' -> {}
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(search.windowToken, 0)
+    }
+
+    private fun updateJump() {
+        btnTop.visibility = if (list.canScrollVertically(-1)) View.VISIBLE else View.GONE
+        btnBottom.visibility = if (list.canScrollVertically(1)) View.VISIBLE else View.GONE
+    }
+
     private fun load(spinner: Boolean) {
         if (loading) {
             swipe.isRefreshing = false
@@ -164,7 +242,11 @@ class MainActivity : Activity() {
                         val cache = st.cacheBytes
                         val data = (st.dataBytes - cache).coerceAtLeast(0)
                         val sys = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-                        AppItem(ai.loadLabel(pm).toString(), ai.packageName, st.appBytes, data, cache, sys)
+                        val label = ai.loadLabel(pm).toString()
+                        AppItem(
+                            label, ai.packageName, st.appBytes, data, cache, sys,
+                            norm(label) + " " + ai.packageName.lowercase()
+                        )
                     } catch (e: Exception) {
                         null
                     }
@@ -201,14 +283,22 @@ class MainActivity : Activity() {
 
     private fun render() {
         val sorted = if (desc) all.sortedByDescending { value(it) } else all.sortedBy { value(it) }
-        adapter.submit(sorted)
+        shown = if (query.isEmpty()) sorted else {
+            val tokens = query.split(' ').filter { it.isNotEmpty() }
+            sorted.filter { a -> tokens.all { a.key.contains(it) } }
+        }
+        adapter.submit(shown)
+        empty.visibility = if (shown.isEmpty() && all.isNotEmpty()) View.VISIBLE else View.GONE
         chips.forEachIndexed { i, c ->
             c.isSelected = i == sortKey
             c.setTextColor(if (i == sortKey) 0xFFFFFFFF.toInt() else 0xFFB4BAD6.toInt())
         }
         chipDir.text = if (desc) "تنازلي ↓" else "تصاعدي ↑"
-        summary.text = "الإجمالي: ${fmt(all.sumOf { it.total })}  •  ${all.size} تطبيق  •  كاش: ${fmt(all.sumOf { it.cache })}"
+        var s = "الإجمالي: ${fmt(all.sumOf { it.total })}  •  ${all.size} تطبيق  •  كاش: ${fmt(all.sumOf { it.cache })}"
+        if (query.isNotEmpty()) s += "  •  نتائج: ${shown.size}"
+        summary.text = s
         updateBar()
+        list.post { updateJump() }
     }
 
     private fun updateBar() {
@@ -217,8 +307,9 @@ class MainActivity : Activity() {
             return
         }
         bottomBar.visibility = View.VISIBLE
-        val pool = all.filter { selectable(it) }
-        val sel = pool.filter { it.pkg in selected }
+        val pool = shown.filter { selectable(it) }
+        // الإجراء ينفَّذ على كل المحدد (حتى لو أخفاه البحث)، والعدد يظهر على الزر
+        val sel = all.filter { it.pkg in selected && selectable(it) }
         val label: String
         val size: Long
         val color: Int
