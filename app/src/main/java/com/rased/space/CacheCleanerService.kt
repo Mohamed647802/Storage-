@@ -1,7 +1,10 @@
 package com.rased.space
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Path
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -28,9 +31,10 @@ class CacheCleanerService : AccessibilityService() {
         }
 
         private val CACHE_KEYS = listOf(
-            "clear cache", "مسح الذاكرة المؤقتة", "مسح ذاكرة التخزين المؤقت",
-            "مسح التخزين المؤقت", "مسح الكاش", "مسح ذاكرة التخزين المؤقتة"
+            "clear cache", "cache", "الذاكرة المؤقتة", "التخزين المؤقت", "الكاش"
         )
+        private val CACHE_WORDS = listOf("cache", "مؤقت", "كاش")
+        private val VERBS = listOf("clear", "delete", "free", "مسح", "حذف", "تفريغ")
         private val DATA_KEYS = listOf(
             "clear storage", "clear all data", "clear data",
             "مسح التخزين", "مسح كل البيانات", "مسح جميع البيانات",
@@ -48,9 +52,11 @@ class CacheCleanerService : AccessibilityService() {
     private var mode = CACHE
     private var step = 0
     private var clicks = 0
+    private var miss = 0
     private var token = 0
     private var busy = false
     private var total = 0
+    private var done = 0
     private var launchedAt = 0L
     private val check = Runnable { process() }
 
@@ -68,7 +74,7 @@ class CacheCleanerService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (running) reschedule(300)
+        if (running && !busy) reschedule(250)
     }
 
     private fun begin(pkgs: List<String>, m: Int) {
@@ -76,9 +82,16 @@ class CacheCleanerService : AccessibilityService() {
         queue.addAll(pkgs)
         mode = m
         total = pkgs.size
+        done = 0
         running = true
         finished = false
         next()
+    }
+
+    private fun scheduleNext(ms: Long) {
+        busy = true
+        val t = token
+        h.postDelayed({ if (t == token && running) next() }, ms)
     }
 
     private fun next() {
@@ -86,11 +99,13 @@ class CacheCleanerService : AccessibilityService() {
         busy = false
         step = 0
         clicks = 0
+        miss = 0
         val pkg = queue.removeFirstOrNull()
         if (pkg == null) {
             finish()
             return
         }
+        done++
         val t = token
         launchedAt = SystemClock.uptimeMillis()
         try {
@@ -102,18 +117,18 @@ class CacheCleanerService : AccessibilityService() {
             next()
             return
         }
-        reschedule(1300)
-        // مهلة أمان: لو علق تطبيق ننتقل للتالي
-        h.postDelayed({ if (t == token && running) next() }, 10000)
+        Toast.makeText(this, "$done / $total", Toast.LENGTH_SHORT).show()
+        reschedule(900)
+        // مهلة أمان: لو علق تطبيق ننتقل للتالي (والتحقق سيعيده لاحقًا)
+        h.postDelayed({ if (t == token && running) next() }, 12000)
     }
 
     private fun finish() {
         running = false
         finished = true
         h.removeCallbacks(check)
-        Toast.makeText(this, "تمت معالجة $total تطبيق", Toast.LENGTH_LONG).show()
         packageManager.getLaunchIntentForPackage(packageName)?.let {
-            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             startActivity(it)
         }
     }
@@ -123,70 +138,101 @@ class CacheCleanerService : AccessibilityService() {
         h.postDelayed(check, ms)
     }
 
+    private fun String.hasAny(l: List<String>) = l.any { contains(it) }
+
     private fun process() {
         if (!running || busy) return
-        if (SystemClock.uptimeMillis() - launchedAt < 1200) {
-            reschedule(600)
+        if (SystemClock.uptimeMillis() - launchedAt < 900) {
+            reschedule(400)
             return
         }
-        val root = rootInActiveWindow
+        val root = rootInActiveWindow ?: windows.firstNotNullOfOrNull { it.root }
         if (root == null || root.packageName?.toString() == packageName) {
-            reschedule(800)
+            reschedule(500)
             return
         }
 
-        // مسح البيانات: بعد الضغط على الزر نبحث عن زر التأكيد في النافذة
+        // مسح البيانات: بعد الضغط على الزر نبحث عن زر التأكيد
         if (mode == DATA && step >= 2) {
             val ok = findExact(root, CONFIRM_KEYS)
             if (ok != null) {
-                busy = true
-                ok.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                val t = token
-                h.postDelayed({ if (t == token && running) next() }, 1000)
+                tap(ok)
+                scheduleNext(1000)
                 return
             }
         }
 
         if (mode == CACHE) {
             val clear = find(root, CACHE_KEYS) {
-                (it.contains("cache") || it.contains("مؤقت") || it.contains("كاش")) &&
+                it.hasAny(CACHE_WORDS) && it.hasAny(VERBS) &&
                     !it.contains("data") && !it.contains("بيانات")
             }
             if (clear != null) {
-                busy = true
-                if (clear.isEnabled) clear.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                val t = token
-                h.postDelayed({ if (t == token && running) next() }, 700)
+                if (clear.isEnabled) tap(clear)
+                scheduleNext(700)
                 return
             }
         } else {
             val clear = find(root, DATA_KEYS) {
-                (it.contains("clear") || it.contains("مسح") || it.contains("delete") || it.contains("حذف")) &&
+                it.hasAny(VERBS) &&
                     (it.contains("data") || it.contains("storage") || it.contains("بيانات") || it.contains("تخزين")) &&
-                    !it.contains("cache") && !it.contains("مؤقت") && !it.contains("كاش") &&
-                    !it.contains("manage") && !it.contains("إدارة")
+                    !it.hasAny(CACHE_WORDS) && !it.contains("manage") && !it.contains("إدارة")
             }
             if (clear != null) {
                 if (!clear.isEnabled) {      // لا توجد بيانات لمسحها
-                    busy = true
-                    next()
+                    scheduleNext(200)
                     return
                 }
                 if (clicks < 3) {
                     clicks++
-                    clear.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    tap(clear)
                     step = 2
-                    reschedule(900)
+                    reschedule(800)
                     return
                 }
             }
         }
 
+        // لم نجد الزر بعد
+        miss++
         if (step == 0) {
-            val st = find(root, STORAGE_KEYS) { s -> BAD_STORAGE.none { s.contains(it) } }
-            if (st != null && st.performAction(AccessibilityNodeInfo.ACTION_CLICK)) step = 1
+            val st = find(root, STORAGE_KEYS) { s -> !s.hasAny(BAD_STORAGE) }
+            if (st != null && tap(st)) step = 1
+        } else if (miss % 5 == 0) {
+            // ربما عدنا لصفحة المعلومات: نعيد فتح التخزين
+            val st = find(root, STORAGE_KEYS) { s -> !s.hasAny(BAD_STORAGE) }
+            if (st != null) tap(st)
+        } else if (miss % 3 == 0) {
+            scroll(root)
         }
-        reschedule(800)
+        reschedule(500)
+    }
+
+    private fun tap(n: AccessibilityNodeInfo): Boolean {
+        if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        val r = Rect()
+        n.getBoundsInScreen(r)
+        if (r.isEmpty) return false
+        val p = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(p, 0, 60))
+            .build()
+        return dispatchGesture(g, null, null)
+    }
+
+    private fun scroll(root: AccessibilityNodeInfo) {
+        val s = findScrollable(root) ?: return
+        s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+    }
+
+    private fun findScrollable(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (n.isScrollable) return n
+        for (i in 0 until n.childCount) {
+            val c = n.getChild(i) ?: continue
+            val r = findScrollable(c)
+            if (r != null) return r
+        }
+        return null
     }
 
     private fun find(
@@ -196,7 +242,7 @@ class CacheCleanerService : AccessibilityService() {
     ): AccessibilityNodeInfo? {
         for (k in keys) {
             for (n in root.findAccessibilityNodeInfosByText(k)) {
-                val t = n.text?.toString()?.lowercase() ?: continue
+                val t = (n.text ?: n.contentDescription)?.toString()?.lowercase() ?: continue
                 if (!ok(t)) continue
                 var c: AccessibilityNodeInfo? = n
                 while (c != null && !c.isClickable) c = c.parent
